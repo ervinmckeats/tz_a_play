@@ -1,0 +1,73 @@
+- hosts: gpu
+  become: true
+  vars:
+    model: unsloth/gemma-3-4b-it
+    api_key: change-me
+  tasks:
+    - name: Copy software
+      copy:
+        src: soft/
+        dest: /opt/soft/
+
+    - name: Install packages
+      shell: apt-get install -y /opt/soft/deb/*.deb
+      register: apt
+      changed_when: "' 0 newly installed' not in apt.stdout"
+
+    - name: Check driver
+      command: nvidia-smi
+      register: smi
+      failed_when: false
+      changed_when: false
+
+    - name: Reboot after driver install
+      reboot:
+      when: smi.rc != 0
+
+    - name: Configure Docker runtime
+      command: nvidia-ctk runtime configure --runtime=docker
+      args:
+        creates: /etc/docker/daemon.json
+      register: ctk
+
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted
+        enabled: true
+      when: ctk.changed
+
+    - name: Load vLLM image
+      shell: docker image inspect vllm/vllm-openai || docker load -i /opt/soft/vllm.tar
+      changed_when: false
+
+    - name: Run vLLM
+      shell: >
+        docker rm -f vllm;
+        docker run -d --name vllm --restart always --gpus all --ipc host -p 8000:8000
+        -e HF_HUB_OFFLINE=1 -v /opt/soft/hf:/root/.cache/huggingface
+        vllm/vllm-openai --model {{ model }} --api-key {{ api_key }} --max-model-len 4096
+
+    - name: Wait for API
+      uri:
+        url: http://127.0.0.1:8000/v1/models
+        headers:
+          Authorization: Bearer {{ api_key }}
+      register: models
+      until: models.status == 200
+      retries: 60
+      delay: 10
+
+    - name: Test generation
+      uri:
+        url: http://127.0.0.1:8000/v1/chat/completions
+        method: POST
+        headers:
+          Authorization: Bearer {{ api_key }}
+        body_format: json
+        body: {model: "{{ model }}", messages: [{role: user, content: "Say OK"}]}
+        timeout: 300
+      register: test
+
+    - debug:
+        msg: "{{ test.json.choices[0].message.content }}"
